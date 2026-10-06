@@ -1,0 +1,335 @@
+---
+title: "Bubble plot — Eukaryotic classes across LMEs (healthy corals)"
+author: "Joana Krause"
+date: "2025-12-15"
+output: html_document
+---
+
+Bubble plot of mean relative abundance (± SD) of eukaryotic classes across Large Marine
+Ecosystems (LMEs) for healthy corals only. X-axis labels include per-LME sample counts.
+Three concentric layers encode variability: outer halo = mean + SD, middle ring = mean,
+inner core = mean − SD.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries
+
+```{r load-libraries, message=FALSE, warning=FALSE}
+library(phyloseq)
+library(ggplot2)
+library(viridis)
+library(tidyr)
+library(dplyr)    # do NOT load plyr — it is not used and masks dplyr::summarise
+library(rlang)    # sym()
+library(glue)     # glue() for dynamic titles
+```
+
+# Load phyloseq object
+
+```{r load-ps}
+ps_plas_V3_V4 <- readRDS("../data/ps_final.rds")
+ps_healthy <- subset_samples(ps_plas_V3_V4, coral_health == "healthy")
+```
+
+# Sort taxa for axis ordering
+
+`unique()` is used directly — the previous `toString() → strsplit(", ")` approach
+silently breaks whenever a taxon name contains a comma.
+
+```{r sort-taxa}
+tax.sort <- as.data.frame(ps_plas_V3_V4@tax_table) %>%
+  arrange(Domain, Supergroup, Division, Subdivision, Class, Order, Family, Genus, Species)
+
+order_sorted       <- c(unique(tax.sort$Order),       "Below Threshold")
+family_sorted      <- c(unique(tax.sort$Family),      "Below Threshold")
+class_sorted_auto  <- c(unique(tax.sort$Class),       "Below Threshold")
+division_sorted    <- c(unique(tax.sort$Division),    "Below Threshold")
+subdivision_sorted <- c(unique(tax.sort$Subdivision), "Below Threshold")
+genus_sorted       <- c(unique(tax.sort$Genus),       "Below Threshold")
+```
+
+
+# Bubble plot — Eukaryotic Classes across Large Marine Ecosystems (healthy corals)
+
+```{r bubble-plot}
+## =============================================================================
+## PURPOSE:
+##   Visualises the mean relative abundance of eukaryotic classes across LMEs
+##   for healthy corals only, as a bubble plot.
+##   Three concentric layers encode variability:
+##     - Outermost halo  → mean + SD  (faint, shows upper spread)
+##     - Middle ring     → mean       (semi-transparent)
+##     - Inner core      → mean − SD  (solid, shows lower spread)
+##
+## METHODOLOGY NOTE:
+##   Each sample is normalised to 100 % independently BEFORE computing group
+##   summaries. This gives true per-sample relative abundances. Using
+##   merge_samples() (which sums raw counts before normalising) is a known
+##   phyloseq pitfall that biases both the mean and the SD — it is intentionally
+##   avoided here.
+## =============================================================================
+
+## ─────────────────────────────────────────────────────────────────────────────
+## 1) USER PARAMETERS
+## ─────────────────────────────────────────────────────────────────────────────
+
+ps_obj         <- ps_healthy      # already filtered to healthy corals
+group_var      <- "geo_loc_lme"
+tax_rank       <- "Class"
+mean_threshold <- 0.1             # taxa with overall mean < this % are collapsed
+
+output_pdf <- "../output/bub/bub_healthy_lme_mean_healthy_12aug.pdf"
+
+## X-axis group order
+sample_order <- c(
+  "Insular Pacific-Hawaiian",
+  "Pacific Central-American Coastal",
+  "Gulf of Mexico",
+  "Caribbean Sea",
+  "Southeast U.S. Continental Shelf",
+  "Northeast U.S. Continental Shelf",
+  "Bermuda",
+  "Mediterranean Sea",
+  "Red Sea",
+  "Arabian Sea",
+  "South China Sea",
+  "West Central Australian Shelf",
+  "Northwest Australian Shelf",
+  "Indonesian Sea",
+  "Micronesia",
+  "Melanesia",
+  "Northeast Australian Shelf",
+  "Polynesia"
+)
+
+## Y-axis taxon order (bottom → top on the plot)
+class_sorted <- c(
+  "Below Threshold",
+  "Eukaryota_XXXX",
+  "Archaeplastida_XXX",
+  # Chlorophyta_X
+  "Ulvophyceae", "Trebouxiophyceae", "Prasino-Clade-9", "Pyramimonadophyceae",
+  "Pedinophyceae", "Chloropicophyceae", "Chlorophyta_XX", "Chlorophyceae",
+  "Chlorodendrophyceae",
+  # Prasinodermophyta_X
+  "Prasinodermophyceae", "Palmophyllophyceae",
+  # Rhodophyta_X
+  "Rhodophyta_XX", "Stylonematophyceae", "Florideophyceae",
+  "Compsopogonophyceae", "Bangiophyceae",
+  # Cryptophyta_X
+  "Cryptophyceae",
+  # Haptophyta_X
+  "Prymnesiophyceae", "Pavlovophyceae",
+  # Rhizaria - Cercozoa
+  "Chlorarachniophyceae",
+  # Alveolata - Apicomplexa
+  "Coccidiomorphea",
+  # Alveolata - Chrompodellids
+  "Colpodellidea",
+  # Alveolata - Dinoflagellata
+  "Dinophyceae",
+  # Stramenopiles - Gyrista
+  "Pinguiophyceae", "Phaeophyceae", "Pelagophyceae", "Mediophyceae",
+  "Gyrista_X", "Eustigmatophyceae", "Dictyochophyceae",
+  "Diatomeae_X", "Coscinodiscophyceae", "Chrysophyceae", "Bacillariophyceae"
+)
+
+## Subdivision order for the fill legend
+subdivision_order <- c(
+  "Gyrista",
+  "Chrompodellids", "Apicomplexa",
+  "Haptophyta_X",
+  "Cryptophyta_X",
+  "Rhodophyta_X", "Prasinodermophyta_X", "Chlorophyta_X",
+  "Archaeplastida_XX",
+  "Eukaryota_XXX",
+  "Below Threshold"
+)
+
+## Named colour palette — every level in subdivision_order has an entry.
+palette <- c(
+  "Gyrista"             = "#9C85C0",
+  "Apicomplexa"         = "#E69F00",
+  "Chrompodellids"      = "#4DAF4A",
+  "Haptophyta_X"        = "#674C2A",
+  "Cryptophyta_X"       = "#DDCC77",
+  "Rhodophyta_X"        = "#BD0A36",
+  "Prasinodermophyta_X" = "#377EB8",
+  "Chlorophyta_X"       = "#ABC817",
+  "Archaeplastida_XX"   = "purple4",
+  "Eukaryota_XXX"       = "#00bfffff",
+  "Below Threshold"     = "#999999"
+)
+
+## ─────────────────────────────────────────────────────────────────────────────
+## 2) Build x-axis labels with per-LME sample counts
+## ─────────────────────────────────────────────────────────────────────────────
+##
+## n is computed from the already-filtered ps_obj (healthy only), so it
+## correctly reflects the number of healthy samples per LME.
+## ifelse(..., "?", ...) guards against LME names in sample_order that are
+## absent from the data — they get "(n=?)" rather than "(n=NA)".
+
+n_df <- data.frame(geo_loc_lme = sample_data(ps_obj)[[group_var]]) %>%
+  dplyr::filter(!is.na(geo_loc_lme)) %>%
+  dplyr::count(geo_loc_lme, name = "n")
+
+x_labs <- setNames(
+  paste0(
+    sample_order, " (n=",
+    ifelse(
+      is.na(match(sample_order, n_df$geo_loc_lme)),
+      "?",
+      n_df$n[match(sample_order, n_df$geo_loc_lme)]
+    ),
+    ")"
+  ),
+  sample_order
+)
+
+## ─────────────────────────────────────────────────────────────────────────────
+## 3) Melt to long format (per-sample relative abundances)
+## ─────────────────────────────────────────────────────────────────────────────
+##
+## prune_samples() drops any samples with zero total counts before normalising,
+## preventing 0/0 → NaN in transform_sample_counts().
+
+melted <- ps_obj %>%
+  tax_glom(taxrank = tax_rank) %>%
+  prune_samples(sample_sums(.) > 0, .) %>%          # zero-sum sample guard
+  transform_sample_counts(function(x) x / sum(x) * 100) %>%
+  psmelt() %>%
+  rename(Group = !!sym(group_var))                   # correct tidy-eval rename
+
+## ─────────────────────────────────────────────────────────────────────────────
+## 4) Mean and SD per taxon × group
+## ─────────────────────────────────────────────────────────────────────────────
+
+dat1 <- melted %>%
+  group_by(
+    OTU, Group,
+    across(all_of(tax_rank)),
+    Subdivision
+  ) %>%
+  summarise(
+    Abund_mean = mean(Abundance, na.rm = TRUE),
+    SD         = sd(Abundance,   na.rm = TRUE),
+    .groups    = "drop"
+  ) %>%
+  mutate(SD = replace(SD, is.na(SD), 0))   # NA SD = single-sample group → 0 spread
+
+## ─────────────────────────────────────────────────────────────────────────────
+## 5) Apply threshold, re-aggregate, set factor levels, compute SD bounds
+## ─────────────────────────────────────────────────────────────────────────────
+
+dat1 <- dat1 %>%
+  ## Overall mean per taxon (mean of per-group means, equally weighted)
+  group_by(.data[[tax_rank]]) %>%
+  mutate(mean_abund = mean(Abund_mean, na.rm = TRUE)) %>%
+  ungroup() %>%
+
+  ## Collapse rare taxa
+  mutate(
+    !!tax_rank  := if_else(mean_abund <= mean_threshold,
+                           "Below Threshold", .data[[tax_rank]]),
+    Subdivision  = if_else(mean_abund <= mean_threshold,
+                           "Below Threshold", Subdivision)
+  ) %>%
+
+  ## Re-aggregate so every Group × "Below Threshold" becomes one summed row.
+  ## Without this step, multiple overlapping bubbles appear instead of one,
+  ## and the "Below Threshold" abundance is understated.
+  ## SD is pooled in quadrature (assumes independence between taxa).
+  group_by(Group, .data[[tax_rank]], Subdivision) %>%
+  summarise(
+    Abund_mean = sum(Abund_mean, na.rm = TRUE),
+    SD         = sqrt(sum(SD^2,  na.rm = TRUE)),
+    .groups    = "drop"
+  ) %>%
+
+  ## Ordered factors for axes and legend
+  mutate(
+    Subdivision  = factor(Subdivision, levels = subdivision_order),
+    tax_rank_fct = factor(.data[[tax_rank]], levels = class_sorted)
+  ) %>%
+
+  ## SD halo bounds, clamped above zero so scale_size_continuous never sees ≤ 0
+  mutate(
+    Abund_upper = pmax(Abund_mean + SD, 1e-6),
+    Abund_lower = pmax(Abund_mean - SD, 1e-6)
+  )
+
+## ─────────────────────────────────────────────────────────────────────────────
+## 6) Bubble plot
+## ─────────────────────────────────────────────────────────────────────────────
+##
+## Three geom_point layers, drawn largest-to-smallest so inner layers are
+## always visible on top:
+##   Layer 1 (α = 0.20): Abund_upper — faint outer glow (mean + SD)
+##   Layer 2 (α = 0.60): Abund_mean  — semi-transparent ring (mean)
+##   Layer 3 (α = 1.00): Abund_lower — solid core (mean − SD)
+
+my_title <- glue(
+  "Eukaryotic {tax_rank} across Large Marine Ecosystems — healthy corals, mean ≥ {mean_threshold}%"
+)
+
+bubp <- ggplot(
+  dat1 %>% filter(Abund_mean > 0),
+  aes(
+    x = factor(Group, levels = sample_order),
+    y = tax_rank_fct
+  )
+) +
+  geom_point(   # outermost halo: mean + SD
+    aes(size = Abund_upper, fill = Subdivision, color = Subdivision),
+    alpha = 0.20, shape = 21, stroke = 0
+  ) +
+  geom_point(   # middle ring: mean
+    aes(size = Abund_mean, fill = Subdivision, color = Subdivision),
+    alpha = 0.60, shape = 21, stroke = 0
+  ) +
+  geom_point(   # inner solid core: mean − SD
+    aes(size = Abund_lower, fill = Subdivision, color = Subdivision),
+    alpha = 1.00, shape = 21, stroke = 0
+  ) +
+  scale_size_continuous(
+    limits = c(1e-6, 100),
+    range  = c(0.1, 10),
+    breaks = c(1, 10, 50, 75)
+  ) +
+  scale_fill_manual(values  = palette, drop = TRUE) +
+  scale_color_manual(values = palette, drop = TRUE) +
+  scale_x_discrete(labels = x_labs) +              # LME names with sample counts
+  labs(
+    x     = group_var,
+    y     = tax_rank,
+    size  = "Relative Abundance (%)",
+    fill  = "Eukaryotic Subdivision",
+    title = my_title
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x     = element_text(angle = 45, vjust = 1, hjust = 1),
+    legend.position = "right"
+  ) +
+  guides(
+    color = "none",
+    fill  = guide_legend(override.aes = list(size = 3))
+  )
+
+print(bubp)
+
+## ─────────────────────────────────────────────────────────────────────────────
+## 7) Save to PDF
+## ─────────────────────────────────────────────────────────────────────────────
+
+dir.create("../output/bub", recursive = TRUE, showWarnings = FALSE)
+
+pdf(output_pdf, width = 8, height = 6)
+print(bubp)
+dev.off()
+```
+
+
