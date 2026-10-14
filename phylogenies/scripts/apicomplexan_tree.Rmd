@@ -1,0 +1,168 @@
+---
+title: "Apicomplexan_tree"
+author: "Joana Krause"
+date: "2025-12-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This script prepares Apicomplexa ASVs for phylogenetic placement. It subsets the
+full phyloseq object to Apicomplexa taxa from healthy coral samples, writes the ASV
+names to `../data/apicomplexan_asvs_healthy_present.txt` for downstream use, and
+exports an ASV–metadata table to
+`../../microbiome/data/ASV_table_apicomplexa_healthy_present.xlsx`.
+
+The bash chunks (`eval=FALSE`) document the HPC pipeline run on a compute cluster:
+backbone SSU rRNA tree inference with RAxML, followed by evolutionary placement of
+amplicon ASVs onto the backbone using HMMER alignment and RAxML EPA.
+
+See `apicomplexan_tree_itol.Rmd` for the iTOL annotation step.
+
+```{r load-data}
+ps_plas_V3_V4 <- readRDS("../../microbiome/data/ps_final.rds")
+```
+
+# Extract Apicomplexa ASVs
+
+We extracted 421 sequences from the dataset.
+
+```{r extract-apicomplexa}
+library(phyloseq)
+library(magrittr)
+
+# 1. Subset to Apicomplexan only
+ps_apis <- subset_taxa(ps_plas_V3_V4, Subdivision == "Apicomplexa")
+
+# 2. Subset to healthy samples
+ps_apis_healthy <- subset_samples(ps_apis, coral_health == "healthy")
+
+# 3. Keep only ASVs present (non-zero) in healthy samples
+ps_apis_healthy_present <- prune_taxa(
+  taxa_sums(ps_apis_healthy) > 0,
+  ps_apis_healthy
+)
+
+# 4. Extract ASV names and write to file
+apicomplexan_asvs_healthy_present <- taxa_names(ps_apis_healthy_present)
+
+dir.create("../data", showWarnings = FALSE, recursive = TRUE)
+write(apicomplexan_asvs_healthy_present,
+      file = "../data/apicomplexan_asvs_healthy_present.txt")  # phylogenies/data/
+```
+
+```{r sanity-checks}
+length(taxa_names(ps_apis))                    # ASVs before filtering
+length(apicomplexan_asvs_healthy_present)      # ASVs after healthy + presence filtering
+all(taxa_sums(ps_apis_healthy_present) > 0)    # confirm no zero-abundance taxa remain
+```
+
+# With metadata
+
+```{r export-metadata}
+library(phyloseq)
+library(tidyverse)
+library(openxlsx)
+
+# 1. Convert OTU table to a data frame (samples as rows)
+otu_df <- as.data.frame(otu_table(ps_apis_healthy_present))
+if (taxa_are_rows(ps_apis_healthy_present)) otu_df <- t(otu_df)
+otu_df <- as.data.frame(otu_df)
+otu_df$SampleID <- rownames(otu_df)
+
+# 2. Pivot long and join sample metadata
+sample_df <- as.data.frame(sample_data(ps_apis_healthy_present))
+sample_df$SampleID <- rownames(sample_df)
+
+otu_long <- otu_df %>%
+  pivot_longer(cols = -SampleID, names_to = "ASV", values_to = "Abundance") %>%
+  left_join(sample_df, by = "SampleID")
+
+# 3. Join taxonomy
+tax_df <- as.data.frame(tax_table(ps_apis_healthy_present))
+tax_df$ASV <- rownames(tax_df)
+
+final_df <- otu_long %>%
+  left_join(tax_df, by = "ASV") %>%
+  filter(Abundance > 0)
+
+# 4. Write to Excel
+write.xlsx(final_df, "../../microbiome/data/ASV_table_apicomplexa_healthy_present.xlsx")
+```
+
+# SSU tree — build backbone
+
+The following bash chunks document the HPC pipeline steps.
+They are not executed on knit (`eval=FALSE`); adjust paths and
+thread counts for your environment.
+
+```{bash build-backbone, eval=FALSE}
+# Build backbone tree with RAxML
+# Requires: raxml environment with raxmlHPC-PTHREADS
+
+raxmlHPC-PTHREADS \
+  -T 16 \
+  -m GTRGAMMAIX \
+  -p 31415 \
+  -x 20398 \
+  -d \
+  -f a \
+  -N 1000 \
+  -n api_plastid_ssu.tre \
+  -s api_plastid_ssu.trimal.fa
+```
+
+# Extract Apicomplexan sequences from full ASV FASTA
+
+```{bash extract-seqs, eval=FALSE}
+cd ../data/EPA
+
+awk '
+FNR==NR { arr[$0]; next }
+/^>/ {
+  found = ""
+  match($0, /^>[^.]*/)
+  if (substr($0, RSTART+1, RLENGTH-1) in arr) found = 1
+}
+found
+' apicomplexan_asvs_healthy_present.txt ASVs.fa > ASVs_extracted.fa
+
+# Linearise (one sequence per line)
+awk '/^>/ { printf("\n%s\n", $0); next } { printf("%s", $0) } END { printf("\n") }' \
+  ASVs_extracted.fa > ASVs_extracted_oneline.fa
+```
+
+# EPA placement
+
+## Align short reads to backbone HMM
+
+```{bash epa-align, eval=FALSE}
+# Requires: hmmer and trees conda environments
+
+conda activate trees
+
+perl fasta2stockholm.pl api_plastid_ssu.aligned.fa > api_plastid_ssu.aligned.sto
+hmmbuild api_plastid_ssu.hmm api_plastid_ssu.aligned.sto
+hmmalign --dna --mapali api_plastid_ssu.aligned.fa api_plastid_ssu.hmm \
+  ASVs_extracted_oneline.fa > epa.aligned.sto
+
+# Convert to FASTA and clean up gap characters
+perl stockholm2fasta.pl epa.aligned.sto > epa.aligned.fa
+awk '/^>/ { print; next } { gsub("\\.", "-"); print }' epa.aligned.fa > cleaned_epa.aligned.fa
+```
+
+## RAxML EPA placement
+
+```{bash epa-placement, eval=FALSE}
+raxmlHPC -T 4 -m GTRGAMMAX -f v -G 0.2 \
+  -n EPARUN.tre \
+  -s cleaned_epa.aligned.fa \
+  -t RAxML_bipartitions.api_plastid_ssu.tre
+
+sed 's/QUERY___//g' RAxML_labelledTree.EPARUN.tre | sed 's/\[I[0-9]*\]//g' \
+  > RAxML_placement_tree_healthy.tre
+```
+
+# iTOL datasets → see `apicomplexan_tree_itol.Rmd`

@@ -1,0 +1,278 @@
+---
+title: "Ostreobium_tree"
+author: "Joana Krause"
+date: "2025-12-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This script prepares Ostreobium ASVs for phylogenetic placement. It subsets the
+full phyloseq object to *Ostreobium* taxa from healthy coral samples, writes the ASV
+names to `../data/ostreobium_asvs_healthy.txt` for downstream use, and exports an
+ASV–metadata table to
+`../../microbiome/data/ASV_table_ostreobium_healthy_present.xlsx`.
+
+The bash chunks (`eval=FALSE`) document the HPC pipeline run on a compute cluster:
+reference sequence clustering and alignment (vsearch, mafft, trimal), model
+selection (ModelTest-NG), backbone SSU rRNA tree inference (RAxML), and evolutionary
+placement of amplicon ASVs onto the backbone using HMMER alignment and RAxML EPA.
+
+Additional R chunks summarise ASV counts per geographic location and coral type, and
+check for Ostreobium presence in octocorals.
+
+See `ostreobium_tree_itol.Rmd` for the iTOL annotation step.
+
+```{r load-data}
+ps_plas_V3_V4 <- readRDS("../../microbiome/data/ps_final.rds")
+```
+
+# Extract Ostreobium ASVs
+
+We extracted 3422 sequences from the dataset.
+
+```{r extract-ostreobium}
+library(phyloseq)
+library(magrittr)
+
+# 1. Subset to Ostreobium only
+ps_ost <- subset_taxa(ps_plas_V3_V4, Genus == "Ostreobium")
+
+# 2. Subset to healthy samples
+ps_ost_healthy <- subset_samples(ps_ost, coral_health == "healthy")
+
+# 3. Keep only ASVs present (non-zero) in healthy samples
+ps_ost_healthy_present <- prune_taxa(
+  taxa_sums(ps_ost_healthy) > 0,
+  ps_ost_healthy
+)
+
+# 4. Extract ASV names and write to file
+ostreobium_asvs_healthy <- taxa_names(ps_ost_healthy_present)
+
+dir.create("../data", showWarnings = FALSE, recursive = TRUE)
+write(ostreobium_asvs_healthy, file = "../data/ostreobium_asvs_healthy.txt")  # phylogenies/data/
+```
+
+```{r sanity-checks}
+length(taxa_names(ps_ost))             # ASVs before filtering
+length(ostreobium_asvs_healthy)        # ASVs after healthy + presence filtering
+all(taxa_sums(ps_ost_healthy_present) > 0)  # confirm no zero-abundance taxa remain
+```
+
+# With metadata
+
+```{r export-metadata}
+library(phyloseq)
+library(tidyverse)
+library(openxlsx)
+
+# 1. Convert OTU table to a data frame (samples as rows)
+otu_df <- as.data.frame(otu_table(ps_ost_healthy_present))
+if (taxa_are_rows(ps_ost_healthy_present)) otu_df <- t(otu_df)
+otu_df <- as.data.frame(otu_df)
+otu_df$SampleID <- rownames(otu_df)
+
+# 2. Pivot long and join sample metadata
+sample_df <- as.data.frame(sample_data(ps_ost_healthy_present))
+sample_df$SampleID <- rownames(sample_df)
+
+otu_long <- otu_df %>%
+  pivot_longer(cols = -SampleID, names_to = "ASV", values_to = "Abundance") %>%
+  left_join(sample_df, by = "SampleID")
+
+# 3. Join taxonomy
+tax_df <- as.data.frame(tax_table(ps_ost_healthy_present))
+tax_df$ASV <- rownames(tax_df)
+
+final_df <- otu_long %>%
+  left_join(tax_df, by = "ASV") %>%
+  filter(Abundance > 0)
+
+# 4. Write to Excel
+write.xlsx(final_df, "../../microbiome/data/ASV_table_ostreobium_healthy_present.xlsx")
+```
+
+# SSU tree — build backbone
+
+The following bash chunks document the HPC pipeline steps.
+They are not executed on knit (`eval=FALSE`); adjust paths and
+thread counts for your environment.
+
+```{bash cluster-align, eval=FALSE}
+# Prepare backbone sequences: cluster, align, trim
+# Requires: vsearch, mafft, trimal
+
+# 1. Sort by length
+vsearch -sortbylength OST1611all.fa -output OST1611all.sorted.fa
+
+# 2. Cluster at 99.5% identity
+vsearch -cluster_smallmem OST1611all.sorted.fa -id 0.995 \
+  -centroids OST1611all.clustered.fa -uc OST1611all.clustered.uc
+
+# 3. Align
+mafft --auto OST1611all.clustered.fa > OST1611all.aligned.fa
+
+# 4. Trim
+trimal -in OST1611all.aligned.fa -out OST1611all.aligned.trimal.fa \
+  -gt 0.3 -st 0.001 -cons 30
+```
+
+```{bash modeltest, eval=FALSE}
+# Select substitution model with ModelTest-NG
+# Requires: modeltest conda environment
+
+conda activate modeltest
+
+modeltest-ng \
+  -i OST1611all.aligned.trimal.fa \
+  -d nt \
+  -t ml \
+  -p 16 \
+  -T raxml \
+  -o modeltest_OST.mtng
+```
+
+```{bash fasttree-check, eval=FALSE}
+# Quick check with FastTree before running full RAxML
+fasttreeMP -gtr -nt OST1611all.aligned.trimal.fa > OST1611all_fasttree.tre
+```
+
+```{bash raxml-backbone, eval=FALSE}
+# Build backbone tree with RAxML
+# Requires: raxml conda environment
+
+conda activate raxml
+
+raxmlHPC-PTHREADS \
+  -T 16 \
+  -m GTRGAMMAX \
+  -p 31415 \
+  -x 20398 \
+  -d \
+  -f a \
+  -N 1000 \
+  -n OST1611all.tre \
+  -s OST1611all.aligned.trimal.fa
+```
+
+# EPA placement
+
+## Extract Ostreobium sequences from full ASV FASTA
+
+```{bash extract-seqs, eval=FALSE}
+cd ../data
+
+awk '
+FNR==NR { arr[$0]; next }
+/^>/ {
+  found = ""
+  match($0, /^>[^.]*/)
+  if (substr($0, RSTART+1, RLENGTH-1) in arr) found = 1
+}
+found
+' ostreobium_asvs_healthy.txt ASVs.fa > ASVs_extracted.fa
+
+# Linearise (one sequence per line)
+awk '/^>/ { printf("\n%s\n", $0); next } { printf("%s", $0) } END { printf("\n") }' \
+  ASVs_extracted.fa > ASVs_extracted_oneline.fa
+
+grep -c '>' ASVs_extracted_oneline.fa
+```
+
+## Align short reads to backbone HMM
+
+```{bash epa-align, eval=FALSE}
+# Requires: hmmer and trees conda environments
+
+conda activate trees
+cd EPA3
+
+perl fasta2stockholm.pl OST1611all.aligned.fa > OST1611all.aligned.sto
+hmmbuild OST1611all.hmm OST1611all.aligned.sto
+hmmalign --dna --mapali OST1611all.aligned.fa OST1611all.hmm \
+  ASVs_extracted_oneline.fa > epa.aligned.sto
+
+# Convert to FASTA and clean up gap characters
+perl stockholm2fasta.pl epa.aligned.sto > epa.aligned.fa
+awk '/^>/ { print; next } { gsub("\\.", "-"); print }' epa.aligned.fa > cleaned_epa.aligned.fa
+```
+
+## ModelTest on EPA alignment
+
+```{bash modeltest-epa, eval=FALSE}
+conda activate modeltest
+
+modeltest-ng \
+  -i cleaned_epa.aligned.fa \
+  -d nt \
+  -t ml \
+  -p 16 \
+  -T raxml \
+  -o modeltest_ost_EPA.mtng
+```
+
+## RAxML EPA placement
+
+```{bash epa-placement, eval=FALSE}
+raxmlHPC -T 4 -m GTRGAMMAIX -f v -G 0.2 \
+  -n EPARUN.tre \
+  -s cleaned_epa.aligned.fa \
+  -t RAxML_bipartitions.OST1611all.tre
+
+sed 's/QUERY___//g' RAxML_labelledTree.EPARUN.tre | sed 's/\[I[0-9]*\]//g' \
+  > RAxML_placement_tree_ost_healthy_epa3.tre
+```
+
+# ASV counts per location / coral type
+
+```{r asvs-by-location}
+library(phyloseq)
+library(dplyr)
+
+# ps_ost_healthy_present should already be in memory from the extraction chunk above.
+# If running standalone, reload ps_plas_V3_V4 and re-run the extraction chunk first.
+
+locations <- c(
+  "Central Pacific", "North East Pacific", "North West Atlantic",
+  "Mediterranean Sea", "Red Sea", "Indian Ocean",
+  "North West Pacific", "South West Pacific"
+)
+
+count_asvs_by_location <- function(ps, loc) {
+  keep <- rownames(sample_data(ps))[sample_data(ps)$generic_location == loc]
+  if (length(keep) == 0) return(0)
+  ntaxa(prune_taxa(taxa_sums(prune_samples(keep, ps)) > 0, prune_samples(keep, ps)))
+}
+
+data.frame(
+  generic_location = locations,
+  ASV_count = sapply(locations, count_asvs_by_location, ps = ps_ost_healthy_present)
+)
+```
+
+```{r asvs-by-coral-type}
+groups <- c("complexa", "robusta", "octocoral")
+
+count_asvs_by_group <- function(ps, grp) {
+  keep <- rownames(sample_data(ps))[sample_data(ps)$complexa_robusta == grp]
+  if (length(keep) == 0) return(0)
+  ntaxa(prune_taxa(taxa_sums(prune_samples(keep, ps)) > 0, prune_samples(keep, ps)))
+}
+
+data.frame(
+  complexa_robusta = groups,
+  ASV_count = sapply(groups, count_asvs_by_group, ps = ps_ost_healthy_present)
+)
+```
+
+```{r octocoral-ostreobium}
+# Which octocoral species have Ostreobium?
+ps_octo <- subset_samples(ps_ost_healthy_present, complexa_robusta == "octocoral")
+ps_octo <- prune_taxa(taxa_sums(ps_octo) > 0, ps_octo)
+length(taxa_names(ps_octo))
+```
+
+# iTOL datasets → see `ostreobium_tree_itol.Rmd`
