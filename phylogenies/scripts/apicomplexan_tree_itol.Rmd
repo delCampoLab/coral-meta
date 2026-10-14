@@ -1,0 +1,347 @@
+---
+title: "Apicomplexa_tree_iTOL"
+author: "Joana Krause"
+date: "2026-08-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This script generates iTOL (Interactive Tree of Life) annotation files for the
+Apicomplexa phylogenetic tree built in `apicomplexan_tree.Rmd`.
+Upload the output files to iTOL to overlay them on the tree.
+
+```{r load-data}
+ps_plas_V3_V4 <- readRDS("../../microbiome/data/ps_final.rds")
+```
+
+```{r itol-apicomplexa}
+# =============================================================================
+# iTOL datasets — Apicomplexa ASVs: simplebars + heatmaps
+# Author: Joana Krause
+# Description:
+#   1) Writes three iTOL SIMPLEBAR tracks per ASV (across all samples):
+#        A. Total reads (raw counts)
+#        B. Prevalence (% of samples where ASV is present)
+#        C. Mean relative abundance (%) within Apicomplexa
+#
+#   2) Writes two iTOL DATASET_HEATMAP files:
+#        - By geographic location (blue scale)
+#        - By coral type: complexa / robusta / octocoral (brown scale)
+#
+#   Zero-masking: ASVs absent from a group (mean = 0) are set to NA and
+#   rendered white in iTOL (COLOR_NA = #ffffff). Non-zero values are
+#   log10-transformed after conversion to %.
+#
+#   Mean relative abundance is computed across ALL samples in a group,
+#   including samples where the ASV is absent (abundance = 0). This is a
+#   prevalence-weighted mean: it reflects both how abundant an ASV is when
+#   present and how frequently it occurs across samples.
+#
+#   Color scales:
+#   - By location:   sequential blue  (#f7fbff -> #9ecae1 -> #08306b)
+#   - By coral type: sequential brown (#f7fbff -> #c19d76 -> #3b2305)
+#
+#   Color scale limits:
+#   - vmin = observed global minimum across both heatmaps (data-driven)
+#   - vmax = observed global maximum across both heatmaps (data-driven)
+#   Both heatmaps share the same scale, making them directly comparable.
+#   The faintest color always corresponds to the rarest real detection.
+#   White = true absence (ASV not detected in any sample of that group).
+# =============================================================================
+
+# -- 0) Libraries --------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(phyloseq)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(tibble)
+})
+
+# -- 1) Parameters — edit here -------------------------------------------------
+ps_input <- ps_plas_V3_V4   # full phyloseq object
+out_dir  <- "../itol"       # phylogenies/itol/
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+locations_order <- c(
+  "Central Pacific",
+  "North East Pacific",
+  "North West Atlantic",
+  "Mediterranean Sea",
+  "Red Sea",
+  "Indian Ocean",
+  "North West Pacific",
+  "South West Pacific"
+)
+
+coral_order <- c("complexa", "robusta", "octocoral")
+
+# -- 2) Subset and normalize ---------------------------------------------------
+ps_sub <- ps_input %>%
+  subset_taxa(Subdivision == "Apicomplexa") %>%
+  subset_samples(coral_health == "healthy" & complexa_robusta != "black coral") %>%
+  prune_taxa(taxa_sums(.) > 0, .) %>%
+  prune_samples(sample_sums(.) > 0, .)
+
+# Relative abundance within Apicomplexa, per sample
+ps_rel <- transform_sample_counts(ps_sub, function(x) {
+  s <- sum(x)
+  if (s == 0) rep(0, length(x)) else x / s
+})
+
+# -- 3) OTU table -> long format -----------------------------------------------
+otu_mat <- as(otu_table(ps_rel), "matrix")
+if (taxa_are_rows(ps_rel)) otu_mat <- t(otu_mat)
+
+otu_long <- as.data.frame(otu_mat) %>%
+  rownames_to_column("SampleID") %>%
+  pivot_longer(cols = -SampleID, names_to = "ASV", values_to = "RelAbund") %>%
+  mutate(RelAbund = as.numeric(RelAbund))
+
+sample_df <- data.frame(sample_data(ps_rel)) %>%
+  rownames_to_column("SampleID")
+
+# -- 4) Helpers ----------------------------------------------------------------
+
+# log10-transform with zero masking:
+# True zeros (absent ASVs) become NA -> rendered white in iTOL via COLOR_NA.
+# Non-zero values are log10-transformed.
+log10_zeromask <- function(mat) {
+  out <- matrix(NA_real_, nrow(mat), ncol(mat), dimnames = dimnames(mat))
+  nonzero <- mat != 0
+  out[nonzero] <- log10(mat[nonzero])
+  out
+}
+
+# Write iTOL SIMPLEBAR file
+write_itol_simplebar <- function(vec, outfile, dataset_label,
+                                 color = "#4B9CD3", width = 60, margin = 6,
+                                 height_factor = 1) {
+  stopifnot(is.numeric(vec), !is.null(names(vec)))
+  con <- file(outfile, open = "wt")
+  on.exit(close(con))
+  writeLines(c(
+    "DATASET_SIMPLEBAR",
+    "SEPARATOR\tTAB",
+    paste0("DATASET_LABEL\t", dataset_label),
+    paste0("COLOR\t",         color),
+    paste0("WIDTH\t",         width),
+    paste0("MARGIN\t",        margin),
+    paste0("HEIGHT_FACTOR\t", height_factor),
+    "DATA"
+  ), con)
+  out <- data.frame(leaf = names(vec), value = as.numeric(vec))
+  out <- out[order(out$leaf), ]
+  write.table(out, con, quote = FALSE, sep = "\t",
+              row.names = FALSE, col.names = FALSE)
+  message("Written: ", outfile)
+}
+
+# Write iTOL DATASET_HEATMAP file
+write_itol_heatmap <- function(heat_wide, field_cols, vmin, vmax,
+                               dataset_label, legend_title,
+                               color_min, color_mid, color_max,
+                               outfile) {
+  con <- file(outfile, "wt")
+  on.exit(close(con))
+  writeLines(c(
+    "DATASET_HEATMAP",
+    "SEPARATOR\tTAB",
+    paste0("DATASET_LABEL\t", dataset_label),
+    paste0("LEGEND_TITLE\t",  legend_title),
+    paste0("FIELD_LABELS\t",  paste(field_cols, collapse = "\t")),
+    paste0("FIELD_COLORS\t",  paste(rep("#c6dbef", length(field_cols)), collapse = "\t")),
+    paste0("COLOR_MIN\t", color_min),
+    paste0("COLOR_MID\t", color_mid),
+    paste0("COLOR_MAX\t", color_max),
+    "USE_MID_COLOR\t1",
+    "COLOR_NA\t#ffffff",
+    sprintf("USER_MIN_VALUE\t%.4f", vmin),
+    sprintf("USER_MAX_VALUE\t%.4f", vmax),
+    "DATA"
+  ), con)
+  for (i in seq_len(nrow(heat_wide))) {
+    vals <- as.numeric(heat_wide[i, field_cols])
+    writeLines(
+      paste(c(heat_wide$ASV[i], sprintf("%.6f", vals)), collapse = "\t"),
+      con
+    )
+  }
+  message("Written: ", outfile)
+}
+
+# =============================================================================
+# PART 1 — Simplebar tracks (all samples pooled, no group breakdown)
+# =============================================================================
+
+# Raw count matrix (taxa as rows) for simplebar metrics
+otu_counts <- as(otu_table(ps_sub), "matrix")
+if (!taxa_are_rows(ps_sub)) otu_counts <- t(otu_counts)
+
+# (A) Total reads per ASV
+total_reads <- rowSums(otu_counts)
+
+# (B) Prevalence: % of samples where ASV is present
+prevalence_pct <- (rowSums(otu_counts > 0) / ncol(otu_counts)) * 100
+
+# (C) Mean relative abundance (%) within Apicomplexa across all samples
+#     Normalized per sample, then averaged (including zeros for absent ASVs)
+otu_rel_pct <- apply(otu_counts, 2, function(x) {
+  s <- sum(x)
+  if (s == 0) rep(0, length(x)) else (x / s) * 100
+})
+mean_rel_abundance_pct <- rowMeans(otu_rel_pct)
+
+# Write simplebar files
+write_itol_simplebar(
+  vec           = total_reads,
+  outfile       = file.path(out_dir, "itol_simplebar_apicomplexa_total_reads.txt"),
+  dataset_label = "Apicomplexa total reads",
+  color         = "#2C7FB8"   # blue
+)
+
+write_itol_simplebar(
+  vec           = prevalence_pct,
+  outfile       = file.path(out_dir, "itol_simplebar_apicomplexa_prevalence_pct.txt"),
+  dataset_label = "Apicomplexa prevalence (% of samples)",
+  color         = "#1A9850"   # green
+)
+
+write_itol_simplebar(
+  vec           = mean_rel_abundance_pct,
+  outfile       = file.path(out_dir, "itol_simplebar_apicomplexa_mean_rel_abundance_pct.txt"),
+  dataset_label = "Apicomplexa mean relative abundance (%)",
+  color         = "#D95F0E"   # orange
+)
+
+# =============================================================================
+# PART 2 — Heatmaps by location and coral type
+# =============================================================================
+
+# -- Location heatmap ----------------------------------------------------------
+
+canon_map <- c(
+  "central pacific"     = "Central Pacific",
+  "north east pacific"  = "North East Pacific",
+  "northeast pacific"   = "North East Pacific",
+  "north west atlantic" = "North West Atlantic",
+  "northwest atlantic"  = "North West Atlantic",
+  "mediterranean"       = "Mediterranean Sea",
+  "mediterranean sea"   = "Mediterranean Sea",
+  "red sea"             = "Red Sea",
+  "indian ocean"        = "Indian Ocean",
+  "north west pacific"  = "North West Pacific",
+  "northwest pacific"   = "North West Pacific",
+  "south west pacific"  = "South West Pacific",
+  "southwest pacific"   = "South West Pacific"
+)
+
+otu_loc <- otu_long %>%
+  left_join(sample_df[, c("SampleID", "generic_location")], by = "SampleID") %>%
+  mutate(generic_location = generic_location %>%
+           as.character() %>%
+           str_replace_all("_", " ") %>%
+           str_squish() %>%
+           str_to_lower() %>%
+           recode(!!!canon_map, .default = NA_character_))
+
+mean_loc <- otu_loc %>%
+  filter(!is.na(generic_location)) %>%
+  group_by(ASV, generic_location) %>%
+  summarise(MeanAbundance = mean(RelAbund, na.rm = TRUE) * 100, .groups = "drop")
+
+heat_loc <- mean_loc %>%
+  pivot_wider(names_from = generic_location, values_from = MeanAbundance,
+              values_fill = 0) %>%
+  arrange(ASV)
+
+present_locs <- intersect(locations_order, colnames(heat_loc))
+heat_loc <- heat_loc[, c("ASV", present_locs)]
+
+mat_loc <- log10_zeromask(as.matrix(heat_loc[, present_locs]))
+heat_loc[, present_locs] <- mat_loc
+
+# -- Coral type heatmap --------------------------------------------------------
+otu_coral <- otu_long %>%
+  left_join(sample_df[, c("SampleID", "complexa_robusta")], by = "SampleID")
+
+mean_coral <- otu_coral %>%
+  filter(!is.na(complexa_robusta)) %>%
+  group_by(ASV, complexa_robusta) %>%
+  summarise(MeanAbundance = mean(RelAbund, na.rm = TRUE) * 100, .groups = "drop")
+
+heat_coral <- mean_coral %>%
+  pivot_wider(names_from = complexa_robusta, values_from = MeanAbundance,
+              values_fill = 0) %>%
+  arrange(ASV)
+
+present_groups <- intersect(coral_order, colnames(heat_coral))
+heat_coral <- heat_coral[, c("ASV", present_groups)]
+
+mat_coral <- log10_zeromask(as.matrix(heat_coral[, present_groups]))
+heat_coral[, present_groups] <- mat_coral
+
+# -- Shared color scale limits -------------------------------------------------
+# Both vmin and vmax are data-driven: computed from the observed non-zero
+# log10 values across both heatmaps. This ensures:
+#   - The faintest color = rarest real detection (no wasted color space)
+#   - The darkest color = most abundant real detection
+#   - Both heatmaps are directly comparable
+vmin_global <- min(
+  min(mat_loc[is.finite(mat_loc)],     na.rm = TRUE),
+  min(mat_coral[is.finite(mat_coral)], na.rm = TRUE)
+)
+vmax_global <- max(
+  max(mat_loc[is.finite(mat_loc)],     na.rm = TRUE),
+  max(mat_coral[is.finite(mat_coral)], na.rm = TRUE)
+)
+
+message(sprintf("Color scale: %.4f to %.4f (log10 %%)", vmin_global, vmax_global))
+message(sprintf("  = %.4f%% to %.2f%% relative abundance",
+                10^vmin_global, 10^vmax_global))
+
+# -- Write heatmap files -------------------------------------------------------
+
+# Location heatmap — blue scale
+write_itol_heatmap(
+  heat_wide     = heat_loc,
+  field_cols    = present_locs,
+  vmin          = vmin_global,
+  vmax          = vmax_global,
+  dataset_label = "Apicomplexa ASVs by location (log10 %, zero-masked)",
+  legend_title  = "Mean relative abundance (log10 %)",
+  color_min     = "#f7fbff",
+  color_mid     = "#9ecae1",
+  color_max     = "#08306b",
+  outfile       = file.path(out_dir, "itol_heatmap_apicomplexa_location_log10_zeromasked.txt")
+)
+
+# Coral type heatmap — brown scale
+write_itol_heatmap(
+  heat_wide     = heat_coral,
+  field_cols    = present_groups,
+  vmin          = vmin_global,
+  vmax          = vmax_global,
+  dataset_label = "Apicomplexa ASVs by coral type (log10 %, zero-masked)",
+  legend_title  = "Mean relative abundance (log10 %)",
+  color_min     = "#f7fbff",
+  color_mid     = "#c19d76",
+  color_max     = "#3b2305",
+  outfile       = file.path(out_dir, "itol_heatmap_apicomplexa_coraltype_log10_zeromasked.txt")
+)
+
+# -- Sanity checks -------------------------------------------------------------
+message("\n-- Sanity checks --")
+message("ASVs total (ps_sub):             ", ntaxa(ps_sub))
+message("ASVs in simplebar tracks:        ", length(total_reads))
+message("ASVs in location heatmap:        ", nrow(heat_loc))
+message("ASVs in coral-type heatmap:      ", nrow(heat_coral))
+message("Location columns:    ", paste(present_locs,   collapse = ", "))
+message("Coral-type columns:  ", paste(present_groups, collapse = ", "))
+message("Non-zero values in location heatmap:   ", sum(is.finite(mat_loc)))
+message("Non-zero values in coral-type heatmap: ", sum(is.finite(mat_coral)))
+```
